@@ -12,14 +12,12 @@ df = pd.read_csv(csv_file)
 
 
 
-print(df["value"].std())
+#print(df["value"].std())
 
 df = df.dropna()
 
-#print(df.)
 
-
-print(df.city.unique())
+#print(df.city.unique())
 
 df["datetime"] = pd.to_datetime(df["date.utc"])
 
@@ -43,7 +41,8 @@ avg_hour = df.groupby([df["datetime"].dt.hour])["value"].mean(0)
 
 json_file = "file.json"
 df_json = pd.read_json(json_file)
+print("Before normalizing:\n", df_json.dtypes)
 df_json_norm = pd.json_normalize(df_json)
 
-print(df_json_norm.dtypes)
-print(df_json_norm["birthDate"])
+print("After normalizing:\n", df_json_norm.dtypes)
+#print(df_json_norm["price"])

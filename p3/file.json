@@ -1,85 +1,282 @@
 [
   {
-    "userId": 1,
-    "username": "johndoe",
-    "email": "johndoe@example.com",
-    "passwordHash": "abc123hashedpassword",
-    "profile": {
-      "firstName": "John",
-      "lastName": "Doe",
-      "birthDate": "1990-01-01",
-      "gender": "male",
-      "avatarUrl": "https://example.com/avatars/johndoe.jpg",
-      "bio": "Software developer with a passion for open-source projects."
+    "productId": 1001,
+    "productName": "Wireless Headphones",
+    "description": "Noise-cancelling wireless headphones with Bluetooth 5.0 and 20-hour battery life.",
+    "brand": "SoundPro",
+    "category": "Electronics",
+    "price": 199.99,
+    "currency": "USD",
+    "stock": {
+      "available": true,
+      "quantity": 50
     },
-    "preferences": {
-      "language": "en",
-      "theme": "dark",
-      "notifications": {
-        "email": true,
-        "sms": false,
-        "push": true
+    "images": [
+      "https://example.com/products/1001/main.jpg",
+      "https://example.com/products/1001/side.jpg"
+    ],
+    "variants": [
+      {
+        "variantId": "1001_01",
+        "color": "Black",
+        "price": 199.99,
+        "stockQuantity": 20
       },
-      "privacy": {
-        "showOnlineStatus": false,
-        "profileVisibility": "friends"
+      {
+        "variantId": "1001_02",
+        "color": "White",
+        "price": 199.99,
+        "stockQuantity": 30
       }
+    ],
+    "dimensions": {
+      "weight": "0.5kg",
+      "width": "18cm",
+      "height": "20cm",
+      "depth": "8cm"
     },
-    "accountStatus": {
-      "isActive": true,
-      "lastLogin": "2025-01-10T12:45:00Z",
-      "createdAt": "2022-05-15T08:30:00Z"
+    "ratings": {
+      "averageRating": 4.7,
+      "numberOfReviews": 120
     },
-    "activityLogs": [
+    "reviews": [
       {
-        "timestamp": "2025-01-09T14:20:00Z",
-        "activity": "Logged in from IP 192.168.1.10"
+        "reviewId": 501,
+        "userId": 101,
+        "username": "techguy123",
+        "rating": 5,
+        "comment": "Amazing sound quality and battery life!"
       },
       {
-        "timestamp": "2025-01-08T10:05:00Z",
-        "activity": "Updated profile picture"
+        "reviewId": 502,
+        "userId": 102,
+        "username": "jane_doe",
+        "rating": 4,
+        "comment": "Great headphones but a bit pricey."
       }
     ]
   },
   {
-    "userId": 2,
-    "username": "janedoe",
-    "email": "janedoe@example.com",
-    "passwordHash": "xyz987hashedpassword",
-    "profile": {
-      "firstName": "Jane",
-      "lastName": "Doe",
-      "birthDate": "1992-04-12",
-      "gender": "female",
-      "avatarUrl": "https://example.com/avatars/janedoe.jpg",
-      "bio": "Digital marketer and blogger."
+    "productId": 1002,
+    "productName": "Smartphone Case",
+    "description": "Durable and shockproof case for smartphones, available in multiple colors.",
+    "brand": "CaseMate",
+    "category": "Accessories",
+    "price": 29.99,
+    "currency": "USD",
+    "stock": {
+      "available": true,
+      "quantity": 200
     },
-    "preferences": {
-      "language": "fr",
-      "theme": "light",
-      "notifications": {
-        "email": false,
-        "sms": true,
-        "push": true
+    "images": [
+      "https://example.com/products/1002/main.jpg",
+      "https://example.com/products/1002/back.jpg"
+    ],
+    "variants": [
+      {
+        "variantId": "1002_01",
+        "color": "Black",
+        "price": 29.99,
+        "stockQuantity": 100
       },
-      "privacy": {
-        "showOnlineStatus": true,
-        "profileVisibility": "public"
+      {
+        "variantId": "1002_02",
+        "color": "Blue",
+        "price": 29.99,
+        "stockQuantity": 100
       }
+    ],
+    "dimensions": {
+      "weight": "0.2kg",
+      "width": "8cm",
+      "height": "15cm",
+      "depth": "1cm"
     },
-    "accountStatus": {
-      "isActive": true,
-      "lastLogin": "2025-01-10T09:15:00Z",
-      "createdAt": "2023-03-20T11:00:00Z"
+    "ratings": {
+      "averageRating": 4.4,
+      "numberOfReviews": 80
     },
-    "activityLogs": [
+    "reviews": [
       {
-        "timestamp": "2025-01-09T18:30:00Z",
-        "activity": "Commented on a post"
+        "reviewId": 601,
+        "userId": 103,
+        "username": "caseuser456",
+        "rating": 4,
+        "comment": "Very sturdy and fits perfectly."
       },
       {
-        "timestamp": "2025-01-08T16:45:00Z",
-        "activity": "Liked a post"
+        "reviewId": 602,
+        "userId": 104,
+        "username": "mobile_fan",
+        "rating": 5,
+        "comment": "Best case I've bought for my phone!"
+      }
+    ]
+  },
+  {
+    "productId": 1003,
+    "productName": "4K Ultra HD Smart TV",
+    "description": "55-inch 4K Ultra HD Smart TV with built-in Wi-Fi and streaming apps.",
+    "brand": "Visionary",
+    "category": "Electronics",
+    "price": 799.99,
+    "currency": "USD",
+    "stock": {
+      "available": true,
+      "quantity": 30
+    },
+    "images": [
+      "https://example.com/products/1003/main.jpg",
+      "https://example.com/products/1003/side.jpg"
+    ],
+    "variants": [
+      {
+        "variantId": "1003_01",
+        "screenSize": "55 inch",
+        "price": 799.99,
+        "stockQuantity": 30
+      }
+    ],
+    "dimensions": {
+      "weight": "15kg",
+      "width": "123cm",
+      "height": "80cm",
+      "depth": "10cm"
+    },
+    "ratings": {
+      "averageRating": 4.8,
+      "numberOfReviews": 250
+    },
+    "reviews": [
+      {
+        "reviewId": 701,
+        "userId": 105,
+        "username": "techlover123",
+        "rating": 5,
+        "comment": "Incredible picture quality, streaming works seamlessly."
+      },
+      {
+        "reviewId": 702,
+        "userId": 106,
+        "username": "homecinema",
+        "rating": 4,
+        "comment": "Great TV, but a little bulky."
+      }
+    ]
+  },
+  {
+    "productId": 1004,
+    "productName": "Bluetooth Speaker",
+    "description": "Portable Bluetooth speaker with 12-hour battery life and water resistance.",
+    "brand": "AudioX",
+    "category": "Electronics",
+    "price": 59.99,
+    "currency": "USD",
+    "stock": {
+      "available": true,
+      "quantity": 100
+    },
+    "images": [
+      "https://example.com/products/1004/main.jpg",
+      "https://example.com/products/1004/side.jpg"
+    ],
+    "variants": [
+      {
+        "variantId": "1004_01",
+        "color": "Red",
+        "price": 59.99,
+        "stockQuantity": 50
+      },
+      {
+        "variantId": "1004_02",
+        "color": "Blue",
+        "price": 59.99,
+        "stockQuantity": 50
+      }
+    ],
+    "dimensions": {
+      "weight": "0.3kg",
+      "width": "15cm",
+      "height": "8cm",
+      "depth": "5cm"
+    },
+    "ratings": {
+      "averageRating": 4.6,
+      "numberOfReviews": 150
+    },
+    "reviews": [
+      {
+        "reviewId": 801,
+        "userId": 107,
+        "username": "musicfan23",
+        "rating": 5,
+        "comment": "Excellent sound quality for its size!"
+      },
+      {
+        "reviewId": 802,
+        "userId": 108,
+        "username": "outdoor_lover",
+        "rating": 4,
+        "comment": "Great for outdoor use, but the battery could last longer."
+      }
+    ]
+  },
+  {
+    "productId": 1005,
+    "productName": "Winter Jacket",
+    "description": "Men's water-resistant winter jacket with a fur-lined hood.",
+    "brand": "ColdTech",
+    "category": "Clothing",
+    "price": 129.99,
+    "currency": "USD",
+    "stock": {
+      "available": true,
+      "quantity": 80
+    },
+    "images": [
+      "https://example.com/products/1005/main.jpg",
+      "https://example.com/products/1005/back.jpg"
+    ],
+    "variants": [
+      {
+        "variantId": "1005_01",
+        "size": "M",
+        "color": "Black",
+        "price": 129.99,
+        "stockQuantity": 30
+      },
+      {
+        "variantId": "1005_02",
+        "size": "L",
+        "color": "Gray",
+        "price": 129.99,
+        "stockQuantity": 50
+      }
+    ],
+    "dimensions": {
+      "weight": "1.5kg",
+      "width": "60cm",
+      "height": "85cm",
+      "depth": "5cm"
+    },
+    "ratings": {
+      "averageRating": 4.5,
+      "numberOfReviews": 60
+    },
+    "reviews": [
+      {
+        "reviewId": 901,
+        "userId": 109,
+        "username": "outdoor_adventurer",
+        "rating": 5,
+        "comment": "Perfect for cold weather, very comfortable!"
+      },
+      {
+        "reviewId": 902,
+        "userId": 110,
+        "username": "winter_gear",
+        "rating": 4,
+        "comment": "Nice jacket, but could be a little warmer."
       }
     ]
   }
