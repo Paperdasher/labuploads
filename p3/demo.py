@@ -42,7 +42,23 @@ avg_hour = df.groupby([df["datetime"].dt.hour])["value"].mean(0)
 json_file = "file.json"
 df_json = pd.read_json(json_file)
 print("Before normalizing:\n", df_json.dtypes)
-df_json_norm = pd.json_normalize(df_json)
 
-print("After normalizing:\n", df_json_norm.dtypes)
-#print(df_json_norm["price"])
+nested_columns = [col for col in df_json.columns if isinstance(df_json[col].iloc[0], dict)]
+if nested_columns:
+    normalized_dfs = []
+    for col in nested_columns:
+        normalized_df = pd.json_normalize(df_json[col])
+        normalized_df.columns = [f"{col}.{sub_col}" for sub_col in normalized_df.columns]
+        normalized_dfs.append(normalized_df)
+    for col in nested_columns:
+        if col in df.columns:
+            combined_df = pd.concat([df.drop(columns = col)] + normalized_dfs, axis = 1)
+        else:
+            combined_df = pd.concat(normalized_dfs, axis = 1)
+else:
+    combined_df = df_json
+
+print("After normalizing:\n", combined_df.dtypes)
+print(df_json["price"])
+
+#print(combined_df["reviews.rating"])
