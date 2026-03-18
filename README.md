@@ -1,1 +1,1 @@
-transfer files from stuycs lab to home computer
+transfer files around machines
