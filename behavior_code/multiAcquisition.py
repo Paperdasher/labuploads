@@ -1,21 +1,33 @@
-# Imports
 import os
 import threading
 import queue
-import numpy as np
-import cv2
-import PySpin
 import subprocess
 import shutil
+from datetime import datetime
+import cv2
+import numpy as np
+import PySpin
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-WRITER_FPS = 60.0 # CHANGE ACCORDINGLY
+TARGET_W   = 1440
+TARGET_H   = 1080
+OFFSET_X   = 0
+OFFSET_Y   = 0
+
+WRITER_FPS    = 60.0               # CHANGE ACCORDINGLY
 WRITER_FOURCC = "mp4v"
-OUTPUT_DIR = "recordings" # name of folder where output video will be stored
+OUTPUT_DIR    = "recordings"       # video output folder name
+
+TRIGGER_LINE       = "Line0"       # GPIO line TTL is wired to
+TRIGGER_ACTIVATION = "RisingEdge"  # RisingEdge or FallingEdge
+TRIGGER_SELECTOR   = "FrameStart"  # FrameStart = one pulse per frame
+                                   # AcquisitionStart = one pulse starts streaming
+
+GETNEXTIMAGE_TIMEOUT = 5000        # ms — increase if TTL pulses are infrequent
 
 
 # ---------------------------------------------------------------------------
@@ -24,25 +36,27 @@ OUTPUT_DIR = "recordings" # name of folder where output video will be stored
 
 class CameraStreamer:
     """
-    One capture thread per camera. Each thread fans out to:
-      - A preview slot  (latest frame only, disposable, non-blocking read)
-      - A writer queue  (every frame, unbounded, blocking write to disk)
+    One capture thread + one writer thread per camera.
+
+    Capture thread fans out to:
+      - Preview slot  (latest frame only, overwritten unconditionally, non-blocking read)
+      - Writer queue  (every frame, unbounded, blocking write to disk via ffmpeg)
     """
 
     def __init__(self, cam_list):
-        self.cam_list = cam_list
+        self.cam_list     = cam_list
         self.camera_count = cam_list.GetSize()
-        self._stop_event = threading.Event()
+        self._stop_event  = threading.Event()
 
-        # Preview path: one slot + one lock per camera
+        # Preview path
         self.preview_frames = [None] * self.camera_count
-        self.preview_locks = [threading.Lock() for _ in range(self.camera_count)]
+        self.preview_locks  = [threading.Lock() for _ in range(self.camera_count)]
 
-        # Writer path: one unbounded queue per camera
+        # Writer path
         self.writer_queues = [queue.Queue() for _ in range(self.camera_count)]
 
         self._capture_threads = []
-        self._writer_threads = []
+        self._writer_threads  = []
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -50,71 +64,212 @@ class CameraStreamer:
         self._start_threads()
 
     # ------------------------------------------------------------------
-    # Spinnaker camera setup  (kept from example)
+    # Spinnaker camera configuration
     # ------------------------------------------------------------------
 
-    def _configure_camera(self, cam, cam_index):
-        """Set AcquisitionMode to Continuous. Extend here for exposure, gain, etc."""
+    def _configure_trigger(self, nodemap, cam_index: int) -> bool:
+        """
+        Configure hardware TTL trigger on TRIGGER_LINE.
+        Must be called before BeginAcquisition().
+        """
+        try:
+            # Turn trigger mode off first so all trigger nodes become writable
+            node_trigger_mode = PySpin.CEnumerationPtr(
+                nodemap.GetNode("TriggerMode")
+            )
+            if PySpin.IsAvailable(node_trigger_mode) and PySpin.IsWritable(
+                node_trigger_mode
+            ):
+                node_trigger_mode.SetIntValue(
+                    node_trigger_mode.GetEntryByName("Off").GetValue()
+                )
+
+            # Trigger selector — what does the trigger act on
+            node_trigger_selector = PySpin.CEnumerationPtr(
+                nodemap.GetNode("TriggerSelector")
+            )
+            if PySpin.IsAvailable(node_trigger_selector) and PySpin.IsWritable(
+                node_trigger_selector
+            ):
+                node_trigger_selector.SetIntValue(
+                    node_trigger_selector.GetEntryByName(TRIGGER_SELECTOR).GetValue()
+                )
+                print(f"  Camera {cam_index}: TriggerSelector = {TRIGGER_SELECTOR}")
+
+            # Trigger source — which GPIO line
+            node_trigger_source = PySpin.CEnumerationPtr(
+                nodemap.GetNode("TriggerSource")
+            )
+            if PySpin.IsAvailable(node_trigger_source) and PySpin.IsWritable(
+                node_trigger_source
+            ):
+                node_trigger_source.SetIntValue(
+                    node_trigger_source.GetEntryByName(TRIGGER_LINE).GetValue()
+                )
+                print(f"  Camera {cam_index}: TriggerSource = {TRIGGER_LINE}")
+
+            # Trigger activation — rising or falling edge
+            node_trigger_activation = PySpin.CEnumerationPtr(
+                nodemap.GetNode("TriggerActivation")
+            )
+            if PySpin.IsAvailable(node_trigger_activation) and PySpin.IsWritable(
+                node_trigger_activation
+            ):
+                node_trigger_activation.SetIntValue(
+                    node_trigger_activation.GetEntryByName(
+                        TRIGGER_ACTIVATION
+                    ).GetValue()
+                )
+                print(f"  Camera {cam_index}: TriggerActivation = {TRIGGER_ACTIVATION}")
+
+            # Turn trigger mode on — camera now waits for hardware signal
+            if PySpin.IsAvailable(node_trigger_mode) and PySpin.IsWritable(
+                node_trigger_mode
+            ):
+                node_trigger_mode.SetIntValue(
+                    node_trigger_mode.GetEntryByName("On").GetValue()
+                )
+                print(f"  Camera {cam_index}: TriggerMode = On")
+
+            return True
+
+        except PySpin.SpinnakerException as ex:
+            print(f"  Camera {cam_index} trigger config error: {ex}")
+            return False
+
+    def _configure_camera(self, cam, cam_index: int) -> bool:
         nodemap = cam.GetNodeMap()
+        print(f"\nCamera {cam_index}: configuring...\n")
 
-        node_acquisition_mode = PySpin.CEnumerationPtr(
-            nodemap.GetNode("AcquisitionMode")
-        )
-        if not PySpin.IsAvailable(node_acquisition_mode) or not PySpin.IsWritable(
-            node_acquisition_mode
-        ):
-            print(
-                f"Camera {cam_index}: unable to set acquisition mode. Aborting."
+        try:
+            # ----------------------------------------------------------------
+            # Pixel format — BGR8 for colour output to ffmpeg (bgr24)
+            # Falls back to BayerRG8 if BGR8 not available on-camera;
+            # Convert() in _capture_frame handles demosaic either way.
+            # ----------------------------------------------------------------
+            node_pixel_format = PySpin.CEnumerationPtr(
+                nodemap.GetNode("PixelFormat")
             )
-            return False
+            if PySpin.IsAvailable(node_pixel_format) and PySpin.IsWritable(
+                node_pixel_format
+            ):
+                node_pixel_format_bgr8 = PySpin.CEnumEntryPtr(
+                    node_pixel_format.GetEntryByName("BGR8")
+                )
+                if not (
+                    PySpin.IsAvailable(node_pixel_format_bgr8)
+                    and PySpin.IsReadable(node_pixel_format_bgr8)
+                ):
+                    node_pixel_format_bgr8 = PySpin.CEnumEntryPtr(
+                        node_pixel_format.GetEntryByName("BayerRG8")
+                    )
+                node_pixel_format.SetIntValue(node_pixel_format_bgr8.GetValue())
+                print(
+                    f"  Pixel format: "
+                    f"{node_pixel_format.GetCurrentEntry().GetSymbolic()}"
+                )
 
-        node_continuous = node_acquisition_mode.GetEntryByName("Continuous")
-        if not PySpin.IsAvailable(node_continuous) or not PySpin.IsReadable(
-            node_continuous
-        ):
-            print(
-                f"Camera {cam_index}: 'Continuous' entry not available. Aborting."
+            # ----------------------------------------------------------------
+            # ROI — zero offsets first, then set dimensions, then re-apply offsets.
+            # This order is mandatory: setting width/height while a non-zero offset
+            # pushes the window out of sensor bounds will be rejected.
+            # ----------------------------------------------------------------
+            node_offset_x = PySpin.CIntegerPtr(nodemap.GetNode("OffsetX"))
+            node_offset_y = PySpin.CIntegerPtr(nodemap.GetNode("OffsetY"))
+
+            if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
+                node_offset_x.SetValue(node_offset_x.GetMin())
+            if PySpin.IsAvailable(node_offset_y) and PySpin.IsWritable(node_offset_y):
+                node_offset_y.SetValue(node_offset_y.GetMin())
+
+            node_width = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+            if PySpin.IsAvailable(node_width) and PySpin.IsWritable(node_width):
+                w_min = node_width.GetMin()
+                w_inc = node_width.GetInc()
+                w_set = min(TARGET_W, node_width.GetMax())
+                w_set = w_min + ((w_set - w_min) // w_inc) * w_inc
+                node_width.SetValue(w_set)
+                print(f"  Width: {node_width.GetValue()}")
+
+            node_height = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
+            if PySpin.IsAvailable(node_height) and PySpin.IsWritable(node_height):
+                h_min = node_height.GetMin()
+                h_inc = node_height.GetInc()
+                h_set = min(TARGET_H, node_height.GetMax())
+                h_set = h_min + ((h_set - h_min) // h_inc) * h_inc
+                node_height.SetValue(h_set)
+                print(f"  Height: {node_height.GetValue()}")
+
+            if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
+                x_inc = node_offset_x.GetInc()
+                x_set = (min(OFFSET_X, node_offset_x.GetMax()) // x_inc) * x_inc
+                node_offset_x.SetValue(x_set)
+                print(f"  OffsetX: {x_set}")
+
+            if PySpin.IsAvailable(node_offset_y) and PySpin.IsWritable(node_offset_y):
+                y_inc = node_offset_y.GetInc()
+                y_set = (min(OFFSET_Y, node_offset_y.GetMax()) // y_inc) * y_inc
+                node_offset_y.SetValue(y_set)
+                print(f"  OffsetY: {y_set}")
+
+            # ----------------------------------------------------------------
+            # TTL trigger
+            # ----------------------------------------------------------------
+            self._configure_trigger(nodemap, cam_index)
+
+            # ----------------------------------------------------------------
+            # Acquisition mode — Continuous
+            # ----------------------------------------------------------------
+            node_acquisition_mode = PySpin.CEnumerationPtr(
+                nodemap.GetNode("AcquisitionMode")
             )
+            if PySpin.IsAvailable(node_acquisition_mode) and PySpin.IsWritable(
+                node_acquisition_mode
+            ):
+                node_continuous = node_acquisition_mode.GetEntryByName("Continuous")
+                if PySpin.IsAvailable(node_continuous) and PySpin.IsReadable(
+                    node_continuous
+                ):
+                    node_acquisition_mode.SetIntValue(node_continuous.GetValue())
+                    print(f"  AcquisitionMode: Continuous")
+                else:
+                    print(f"  Camera {cam_index}: Continuous mode not available.")
+                    return False
+                
+            if cam.ExposureAuto.GetAccessMode() != PySpin.RW:
+                print('Unable to disable automatic exposure. Aborting...')
+                return False
+
+            cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
+            print('Automatic exposure disabled...')
+
+            # Ensure desired exposure time does not exceed the maximum
+            exposure_time_to_set = 5000 # 5ms or 5000 microseconds
+            exposure_time_to_set = min(cam.ExposureTime.GetMax(), exposure_time_to_set)
+            cam.ExposureTime.SetValue(exposure_time_to_set)
+            print('Shutter time set to %s us...\n' % exposure_time_to_set)
+
+            return True
+
+        except PySpin.SpinnakerException as ex:
+            print(f"  Camera {cam_index} configure error: {ex}")
             return False
-
-        node_acquisition_mode.SetIntValue(node_continuous.GetValue())
-        print(f"Camera {cam_index}: acquisition mode set to Continuous.")
-
-        if cam.ExposureAuto.GetAccessMode() != PySpin.RW:
-            print('Unable to disable automatic exposure. Aborting...')
-            return False
-
-        cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
-        print('Automatic exposure disabled...')
-
-        # Ensure desired exposure time does not exceed the maximum
-        exposure_time_to_set = 5000 # 5 miliseconds / 5000 microseconds 
-        exposure_time_to_set = min(cam.ExposureTime.GetMax(), exposure_time_to_set)
-        cam.ExposureTime.SetValue(exposure_time_to_set)
-        print('Shutter time set to %s us...\n' % exposure_time_to_set)
-
-        return True
 
     def _init_cameras(self):
         for i, cam in enumerate(self.cam_list):
             cam.Init()
             self._configure_camera(cam, i)
             cam.BeginAcquisition()
-            print(f"Camera {i}: acquisition started.")
+            print(f"Camera {i}: armed, waiting for TTL on {TRIGGER_LINE}.")
 
     # ------------------------------------------------------------------
-    # Capture thread  (one per camera)
+    # Capture thread — one per camera
     # ------------------------------------------------------------------
 
     def _capture_frame(self, index: int, cam):
-        """
-        Runs in its own thread. Grabs frames from Spinnaker, releases the
-        image buffer immediately, then fans out to preview slot and writer queue.
-        """
         while not self._stop_event.is_set():
             try:
-                # 1000 ms timeout so the thread can check _stop_event periodically
-                image_result = cam.GetNextImage(1000)
+                image_result = cam.GetNextImage(GETNEXTIMAGE_TIMEOUT)
 
                 if image_result.IsIncomplete():
                     print(
@@ -124,53 +279,59 @@ class CameraStreamer:
                     image_result.Release()
                     continue
 
-                converted = image_result.Convert(PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR)
-                frame = np.array(converted.GetNDArray(), copy=True)  # one copy, owns the data
-                image_result.Release()                                # safe — frame is independent
+                # Convert to BGR8 — consistent pixel format for both preview
+                # (cv2.imshow) and writer (ffmpeg bgr24). If the camera is already
+                # BGR8 this is a no-op internally.
+                converted = image_result.Convert(
+                    PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR
+                )
+                # One copy owns the data; Release() is then safe immediately.
+                frame = np.array(converted.GetNDArray(), copy=True)
+                image_result.Release()
 
+                # Preview path — overwrite slot, never blocks
                 with self.preview_locks[index]:
-                    self.preview_frames[index] = frame       # preview holds a reference
+                    self.preview_frames[index] = frame
 
-                self.writer_queues[index].put(frame)         # writer holds the same reference
+                # Writer path — same array, writer never mutates it
+                self.writer_queues[index].put(frame)
 
             except PySpin.SpinnakerException as ex:
                 if not self._stop_event.is_set():
                     print(f"Camera {index} capture error: {ex}")
 
     # ------------------------------------------------------------------
-    # Writer thread  (one per camera)
+    # Writer thread — one per camera
     # ------------------------------------------------------------------
 
-    def _make_ffmpeg_writer(self, output_path: str, width: int, height: int) -> subprocess.Popen:
-        """
-        Open an ffmpeg process that reads raw BGR frames from stdin and encodes
-        to H.264 in an MP4 container with faststart.
-        """
+    def _make_ffmpeg_writer(
+        self, output_path: str, width: int, height: int
+    ) -> subprocess.Popen:
         if not shutil.which("ffmpeg"):
             raise RuntimeError("ffmpeg not found on PATH")
 
         cmd = [
             "ffmpeg",
-            "-y",                           # overwrite output if exists
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "bgr24",            # matches OpenCV/Spinnaker BGR8 numpy layout
-            "-s", f"{width}x{height}",
-            "-r", str(WRITER_FPS),
-            "-i", "pipe:0",                 # read from stdin
-            "-vcodec", "libx264",
-            "-preset", "fast",              # fast/medium/slow — tradeoff encode speed vs filesize
-            "-crf", "18",                   # quality: 0=lossless, 51=worst; 18 is near-lossless
-            "-pix_fmt", "yuv420p",          # broadest player compatibility
-            "-movflags", "+faststart",      # moov atom at front — file is playable while recording
+            "-y",
+            "-f",       "rawvideo",
+            "-vcodec",  "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s",       f"{width}x{height}",
+            "-r",       str(WRITER_FPS),
+            "-i",       "pipe:0",
+            "-vcodec",  "libx264",
+            "-preset",  "fast",
+            "-crf",     "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             output_path,
         ]
         return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-
     def _write_frames(self, index: int, serial: str):
-        output_path = os.path.join(OUTPUT_DIR, f"camera_{serial}.mp4")
-        proc = None
+        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(OUTPUT_DIR, f"camera_{serial}_{ts}.mp4")
+        proc        = None
 
         while not self._stop_event.is_set():
             try:
@@ -178,33 +339,31 @@ class CameraStreamer:
             except queue.Empty:
                 continue
 
+            # Lazily open ffmpeg on the first frame so dimensions are known
             if proc is None:
                 h, w = frame.shape[:2]
                 proc = self._make_ffmpeg_writer(output_path, w, h)
                 print(f"Camera {index}: writing to {output_path} at {w}x{h}")
 
-            # prevent breaking if ffmpeg exits unexpectedly
             try:
                 proc.stdin.write(frame.tobytes())
             except BrokenPipeError:
                 print(f"Camera {index}: ffmpeg pipe broken, restarting writer...")
-                proc = None   # will reinitialize on next frame
+                proc = None
 
-        # Drain remaining frames
+        # Drain remaining frames on shutdown so nothing is lost
         while not self.writer_queues[index].empty():
             try:
                 frame = self.writer_queues[index].get_nowait()
                 if proc:
                     proc.stdin.write(frame.tobytes())
-            except queue.Empty:
+            except (queue.Empty, BrokenPipeError):
                 break
 
-        # Close stdin so ffmpeg knows the stream is done, then wait for it to finish muxing
         if proc:
             proc.stdin.close()
             proc.wait()
-            print(f"Camera {index}: ffmpeg writer finished.")
-
+            print(f"Camera {index}: writer finished.")
 
     # ------------------------------------------------------------------
     # Thread startup
@@ -237,16 +396,14 @@ class CameraStreamer:
     # ------------------------------------------------------------------
 
     def get_preview(self, index: int):
-        """Non-blocking. Returns the latest frame (numpy BGR) or None."""
+        """Non-blocking. Returns latest BGR numpy frame or None."""
         with self.preview_locks[index]:
             return self.preview_frames[index]
 
     def stop(self):
-        """Signal all threads to stop, then clean up Spinnaker resources."""
-        print("Stopping acquisition...")
+        print("\nStopping acquisition...")
         self._stop_event.set()
 
-        # Wait for writer threads to flush (capture threads are daemons, skip join)
         for wt in self._writer_threads:
             wt.join(timeout=5.0)
 
@@ -254,15 +411,14 @@ class CameraStreamer:
             cam.EndAcquisition()
             cam.DeInit()
 
-        del cam  # Spinnaker: explicit del, not just None assignment
+        del cam
 
 
 # ---------------------------------------------------------------------------
-# Helpers  (kept from example)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _get_serial(cam, cam_index: int) -> str:
-    """Read device serial number from TL nodemap."""
     try:
         node = PySpin.CStringPtr(
             cam.GetTLDeviceNodeMap().GetNode("DeviceSerialNumber")
@@ -275,7 +431,6 @@ def _get_serial(cam, cam_index: int) -> str:
 
 
 def print_device_info(nodemap, cam_index: int) -> bool:
-    """Print transport-layer device info. Kept verbatim from example."""
     print(f"Printing device information for camera {cam_index}...\n")
     try:
         node_device_information = PySpin.CCategoryPtr(
@@ -308,7 +463,6 @@ def print_device_info(nodemap, cam_index: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> bool:
-    # Write-permission check (kept from example)
     try:
         test_file = open("test.txt", "w+")
         test_file.close()
@@ -317,15 +471,14 @@ def main() -> bool:
         print("Unable to write to current directory. Please check permissions.")
         return False
 
-    # Spinnaker system init (kept from example)
-    system = PySpin.System.GetInstance()
+    system  = PySpin.System.GetInstance()
     version = system.GetLibraryVersion()
     print(
         f"Spinnaker library version: "
         f"{version.major}.{version.minor}.{version.type}.{version.build}"
     )
 
-    cam_list = system.GetCameras()
+    cam_list    = system.GetCameras()
     num_cameras = cam_list.GetSize()
     print(f"Cameras detected: {num_cameras}")
 
@@ -335,16 +488,14 @@ def main() -> bool:
         print("No cameras found.")
         return False
 
-    # Print device info for each camera (kept from example)
-    print("*** DEVICE INFORMATION ***\n")
+    print("\n*** DEVICE INFORMATION ***\n")
     for i, cam in enumerate(cam_list):
         print_device_info(cam.GetTLDeviceNodeMap(), i)
 
-    # Start streamer
     streamer = CameraStreamer(cam_list)
-    labels = [f"Camera {_get_serial(cam, i)}" for i, cam in enumerate(cam_list)]
+    labels   = [f"Camera {_get_serial(cam, i)}" for i, cam in enumerate(cam_list)]
 
-    print("Streaming — press ESC to stop.\n")
+    print("\nStreaming — press ESC to stop.\n")
     try:
         while True:
             for i in range(streamer.camera_count):
@@ -352,13 +503,11 @@ def main() -> bool:
                 if frame is not None:
                     cv2.imshow(labels[i], frame)
 
-            if cv2.waitKey(20) == 27:  # ESC
+            if cv2.waitKey(20) == 27: # ESC
                 break
     finally:
         streamer.stop()
         cv2.destroyAllWindows()
-
-        # Spinnaker cleanup (kept from example)
         cam_list.Clear()
         system.ReleaseInstance()
         print("Done.")
