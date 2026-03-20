@@ -40,18 +40,21 @@ cameras:
     name: "top"
     enabled: true
     master: true
+    exposure_us: 500
 
   cam1:
     serial: "87654321" # PLACEHOLDER
     name: "side"
     enabled: true
     master: false
+    exposure_us: 500
 
   cam2:
     serial: "11223344" # PLACEHOLDER
     name: "front"
     enabled: true
     master: false
+    exposure_us: 500
 
 # Preview settings
 preview:

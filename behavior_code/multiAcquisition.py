@@ -329,7 +329,8 @@ class CameraStreamer:
             print('Automatic exposure disabled...')
 
             # Ensure desired exposure time does not exceed the maximum
-            exposure_time_to_set = 5000 # 5ms or 5000 microseconds
+            cam_cfg = self.cam_configs[cam_name]
+            exposure_time_to_set = cam_cfg.get("exposure_us", 5000)
             exposure_time_to_set = min(cam.ExposureTime.GetMax(), exposure_time_to_set)
             cam.ExposureTime.SetValue(exposure_time_to_set)
             print('Shutter time set to %s us...\n' % exposure_time_to_set)
@@ -354,31 +355,6 @@ class CameraStreamer:
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
-
-    def _init_metadata(self, cam_name: str):
-        """Open a CSV file and write the header row. Returns (file_handle, csv_writer)."""
-        if not self.metadata_config.get("enabled", False):
-            return None, None
-
-        cfg   = self.metadata_config
-        label = self.cam_configs[cam_name].get("name", cam_name)
-        path  = os.path.join(self.output_dir, f"{label}_metadata.csv")
-
-        f      = open(path, "w", newline="")
-        writer = csv.writer(f)
-
-        # Build header from whatever fields are enabled in config
-        header = []
-        if cfg.get("save_framecount", True): header.append("framecount")
-        if cfg.get("save_timestamp",  True): header.append("timestamp_s")
-        if cfg.get("save_sestime",    True): header.append("sestime_s")
-        if cfg.get("save_cputime",    True): header.append("cputime_s")
-
-        writer.writerow(header)
-        f.flush()
-
-        print(f"{cam_name}: metadata → {path}")
-        return f, writer
 
     def _append_metadata(self, writer, framecount, timestamp, sestime, cputime):
         """Append one row. Only writes columns that are enabled in config."""
@@ -427,18 +403,16 @@ class CameraStreamer:
                 frame = np.array(converted.GetNDArray(), copy=True)
                 image_result.Release()
 
-                ttl_count += 1   # one successfully acquired frame = one TTL received
+                # After image_result.Release(), inside the while loop
+                ttl_count += 1
 
                 if frame_idx % downsample == 0:
                     with self.preview_locks[cam_name]:
                         self.preview_frames[cam_name] = frame
 
-                # Writer path — one unbounded queue per camera
-                self.writer_queues  = {name: queue.Queue()   for name in self.cam_names}
-
-                # Populated by capture threads on exit, read by writer threads for session summary
-                self._final_ttl_counts:   dict[str, int] = {}
-                self._final_frame_counts: dict[str, int] = {}
+                self.writer_queues[cam_name].put(
+                    (frame, framecount, timestamp, sestime, cputime)
+                )
 
                 frame_idx += 1
 
@@ -629,6 +603,65 @@ def print_device_info(nodemap, cam_name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def __init__(self, config: dict, system: PySpin.System):
+    self.config       = config
+    self.system       = system
+    self._stop_event  = threading.Event()
+    self.start_t      = time.perf_counter()
+
+    self.cam_configs = {
+        name: cfg
+        for name, cfg in config["cameras"].items()
+        if cfg.get("enabled", True)
+    }
+
+    self.camera_count = len(self.cam_configs)
+    self.cam_names    = list(self.cam_configs.keys())
+    self.cameras: dict[str, PySpin.Camera] = {}
+
+    self.preview_frames = {name: None             for name in self.cam_names}
+    self.preview_locks  = {name: threading.Lock() for name in self.cam_names}
+    self.writer_queues  = {name: queue.Queue()    for name in self.cam_names}
+
+    self._final_ttl_counts:   dict[str, int] = {}
+    self._final_frame_counts: dict[str, int] = {}
+
+    self._capture_threads: list[threading.Thread] = []
+    self._writer_threads:  list[threading.Thread] = []
+
+    rec = config["recording"]
+    self.fps     = rec["fps"]
+    self.codec   = rec["codec"]
+    self.crf     = str(rec["crf"])
+    self.preset  = rec["preset"]
+    self.pix_fmt = rec["pixel_format"]
+
+    roi = config.get("roi", {})
+    self.target_w = roi.get("width",    None)
+    self.target_h = roi.get("height",   None)
+    self.offset_x = roi.get("offset_x", 0)
+    self.offset_y = roi.get("offset_y", 0)
+
+    trig = config.get("trigger", {})
+    self.trigger_enabled    = trig.get("enabled",    False)
+    self.trigger_line       = trig.get("line",       "Line0")
+    self.trigger_activation = trig.get("activation", "RisingEdge")
+    self.trigger_selector   = trig.get("selector",   "AcquisitionStart")
+    self.trigger_timeout    = trig.get("timeout_ms", 5000)
+
+    self.metadata_config = config.get("metadata", {})
+
+    save_dir   = config["save_dir"]
+    experiment = datetime.now().strftime("%Y%m%d_%H%M%S")
+    self.output_dir = os.path.join(save_dir, experiment)
+    os.makedirs(self.output_dir, exist_ok=True)
+
+    with open(os.path.join(self.output_dir, "config.yaml"), "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    self._init_cameras()
+    self._start_threads()
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-camera acquisition.")
