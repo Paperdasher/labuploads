@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------------------
+# Acquisition configuration
+# Edit this file to configure cameras, saving, and trigger settings.
+# All settings here will be exposed in the GUI.
+# ---------------------------------------------------------------------------
+
+# Where recordings and metadata are saved
+save_dir: "recordings"
+
+# Recording settings
+recording:
+  fps: 60.0               # CHANGE LATER
+  codec: libx264          # libx264 (CPU) | h264_nvenc (NVIDIA) | h264_videotoolbox (Apple)
+  crf: 18                 # Quality: 0=lossless, 51=worst. 18 is near-lossless
+  preset: fast            # ultrafast/fast/medium/slow — speed vs filesize tradeoff
+  pixel_format: yuv420p   # yuv420p for broad player compatibility
+
+# ROI — applied to all cameras. Set to null to use full sensor resolution.
+roi:
+  width: 1440
+  height: 1080
+  offset_x: 0
+  offset_y: 0
+
+# Hardware TTL trigger
+trigger:
+  enabled: true
+  line: Line0             # Line0 | Line1 | Line2 | Line3
+  activation: RisingEdge  # RisingEdge | FallingEdge
+  selector: AcquisitionStart  # AcquisitionStart | FrameStart
+  timeout_ms: 5000        # how long GetNextImage waits before timing out
+
+# Cameras — add one entry per camera.
+# serial: the camera's serial number (printed on the housing, or run print_device_info)
+# name:   human-readable label used in preview window and output filename
+# master: true for the camera whose strobe line drives slaves (if using hardware sync between cameras)
+cameras:
+  cam0:
+    serial: "12345678" # PLACEHOLDER
+    name: "top"
+    enabled: true
+    master: true
+
+  cam1:
+    serial: "87654321" # PLACEHOLDER
+    name: "side"
+    enabled: true
+    master: false
+
+  cam2:
+    serial: "11223344" # PLACEHOLDER
+    name: "front"
+    enabled: true
+    master: false
+
+# Preview settings
+preview:
+  enabled: true
+  downsample: 2           # show every Nth frame in preview (1 = every frame)
+
+# Metadata — saved as HDF5 alongside each video
+metadata:
+  enabled: true
+  save_framecount: true
+  save_timestamp: true
+  save_sestime: true
+  save_cputime: true
