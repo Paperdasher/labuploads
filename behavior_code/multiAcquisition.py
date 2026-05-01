@@ -27,6 +27,62 @@ def load_config(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class CameraStreamer:
+    def __init__(self, config: dict, system: "PySpin.SystemPtr"):
+        self.config       = config
+        self.system       = system
+        self._stop_event  = threading.Event()
+        self.start_t      = time.perf_counter()
+
+        self.cam_configs = {
+            name: cfg
+            for name, cfg in config["cameras"].items()
+            if cfg.get("enabled", True)
+        }
+
+        self.camera_count = len(self.cam_configs)
+        self.cam_names    = list(self.cam_configs.keys())
+        self.cameras: dict[str, PySpin.Camera] = {}
+
+        self.preview_frames = {name: None             for name in self.cam_names}
+        self.preview_locks  = {name: threading.Lock() for name in self.cam_names}
+        self.writer_queues  = {name: queue.Queue()    for name in self.cam_names}
+
+        self._final_ttl_counts:   dict[str, int] = {}
+        self._final_frame_counts: dict[str, int] = {}
+
+        self._capture_threads: list[threading.Thread] = []
+        self._writer_threads:  list[threading.Thread] = []
+
+        rec = config["recording"]
+        self.fps              = rec["fps"]
+        self.jpeg_quality     = rec.get("jpeg_quality", 90)  # MJPEG JPEG compression quality (0–100)
+        # Video file split size: None means no splitting (record as one continuous file)
+        self.split_size_mb    = rec.get("split_size_mb", None)
+
+        roi = config.get("roi", {})
+        self.target_w = roi.get("width",    None)
+        self.target_h = roi.get("height",   None)
+        self.offset_x = roi.get("offset_x", 0)
+        self.offset_y = roi.get("offset_y", 0)
+
+        trig = config.get("trigger", {})
+        self.trigger_enabled    = trig.get("enabled",    False)
+        self.trigger_line       = trig.get("line",       "Line0")
+        self.trigger_activation = trig.get("activation", "RisingEdge")
+        self.trigger_selector   = trig.get("selector",   "AcquisitionStart")
+        self.trigger_timeout    = trig.get("timeout_ms", 5000)
+
+        self.metadata_config = config.get("metadata", {})
+
+        save_dir   = config["save_dir"]
+        experiment = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_dir = os.path.join(save_dir, experiment)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Save a copy of the config used for this session alongside the recordings
+        with open(os.path.join(self.output_dir, "config.yaml"), "w") as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
@@ -84,7 +140,7 @@ class CameraStreamer:
     ):
         """
         Write a one-row session summary CSV once acquisition is complete.
-        This is the file you'll merge with your neurorecording session log.
+        This is the file merged with the neurorecording session log.
         """
         if not self.metadata_config.get("enabled", False):
             return
@@ -227,7 +283,7 @@ class CameraStreamer:
 
         try:
             # ----------------------------------------------------------------
-            # Pixel format
+            # Pixel format — Mono8 matches SpinView setting
             # ----------------------------------------------------------------
             node_pixel_format = PySpin.CEnumerationPtr(
                 nodemap.GetNode("PixelFormat")
@@ -235,68 +291,80 @@ class CameraStreamer:
             if PySpin.IsAvailable(node_pixel_format) and PySpin.IsWritable(
                 node_pixel_format
             ):
-                node_bgr8 = PySpin.CEnumEntryPtr(
-                    node_pixel_format.GetEntryByName("BGR8")
-                )
-                if not (
-                    PySpin.IsAvailable(node_bgr8) and PySpin.IsReadable(node_bgr8)
-                ):
-                    node_bgr8 = PySpin.CEnumEntryPtr(
-                        node_pixel_format.GetEntryByName("BayerRG8")
+                for fmt_name in ["Mono8", "Mono16", "BayerRG8", "BGR8"]:
+                    node_entry = PySpin.CEnumEntryPtr(
+                        node_pixel_format.GetEntryByName(fmt_name)
                     )
-                node_pixel_format.SetIntValue(node_bgr8.GetValue())
-                print(
-                    f"  Pixel format: "
-                    f"{node_pixel_format.GetCurrentEntry().GetSymbolic()}"
-                )
+                    if PySpin.IsAvailable(node_entry) and PySpin.IsReadable(node_entry):
+                        node_pixel_format.SetIntValue(node_entry.GetValue())
+                        print(f"  Pixel format: {fmt_name}")
+                        break
+            else:
+                print("  Warning: could not set any preferred pixel format")
 
             # ----------------------------------------------------------------
-            # ROI — only apply if specified in config
+            # ROI — only apply if width/height specified in config.
+            # Offsets are calculated automatically to center the ROI on the
+            # full sensor; any manual offset_x/offset_y in config is ignored
+            # when centering is used.
             # ----------------------------------------------------------------
             if self.target_w is not None and self.target_h is not None:
                 node_offset_x = PySpin.CIntegerPtr(nodemap.GetNode("OffsetX"))
                 node_offset_y = PySpin.CIntegerPtr(nodemap.GetNode("OffsetY"))
+                node_width    = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+                node_height   = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
 
-                # Zero offsets first
+                # Step 1 — zero offsets so we can freely set width/height
                 if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
                     node_offset_x.SetValue(node_offset_x.GetMin())
                 if PySpin.IsAvailable(node_offset_y) and PySpin.IsWritable(node_offset_y):
                     node_offset_y.SetValue(node_offset_y.GetMin())
 
-                node_width = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+                # Step 2 — set width, snapped to the camera's increment
+                actual_w = node_width.GetMax()   # sensor full width (pixels)
                 if PySpin.IsAvailable(node_width) and PySpin.IsWritable(node_width):
                     w_min = node_width.GetMin()
                     w_inc = node_width.GetInc()
                     w_set = min(self.target_w, node_width.GetMax())
                     w_set = w_min + ((w_set - w_min) // w_inc) * w_inc
                     node_width.SetValue(w_set)
-                    print(f"  Width: {node_width.GetValue()}")
+                    actual_w = node_width.GetValue()
+                    print(f"  Width: {actual_w}")
 
-                node_height = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
+                # Step 3 — set height, snapped to the camera's increment
+                actual_h = node_height.GetMax()  # sensor full height (pixels)
                 if PySpin.IsAvailable(node_height) and PySpin.IsWritable(node_height):
                     h_min = node_height.GetMin()
                     h_inc = node_height.GetInc()
                     h_set = min(self.target_h, node_height.GetMax())
                     h_set = h_min + ((h_set - h_min) // h_inc) * h_inc
                     node_height.SetValue(h_set)
-                    print(f"  Height: {node_height.GetValue()}")
+                    actual_h = node_height.GetValue()
+                    print(f"  Height: {actual_h}")
 
-                # Re-apply offsets
+                # Step 4 — compute centered offsets.
+                # offset = (sensor_max - roi_size) / 2, snapped down to the
+                # nearest valid increment so the value is always in range.
+                sensor_w = node_offset_x.GetMax() + actual_w   # max offset + roi = sensor width
+                sensor_h = node_offset_y.GetMax() + actual_h
+
                 if PySpin.IsAvailable(node_offset_x) and PySpin.IsWritable(node_offset_x):
                     x_inc = node_offset_x.GetInc()
-                    x_set = (
-                        min(self.offset_x, node_offset_x.GetMax()) // x_inc
-                    ) * x_inc
+                    x_center = (sensor_w - actual_w) // 2
+                    x_set = (x_center // x_inc) * x_inc          # snap to increment
+                    x_set = max(node_offset_x.GetMin(),
+                                min(node_offset_x.GetMax(), x_set))
                     node_offset_x.SetValue(x_set)
-                    print(f"  OffsetX: {x_set}")
+                    print(f"  OffsetX: {x_set}  (centered on {sensor_w}px sensor)")
 
                 if PySpin.IsAvailable(node_offset_y) and PySpin.IsWritable(node_offset_y):
                     y_inc = node_offset_y.GetInc()
-                    y_set = (
-                        min(self.offset_y, node_offset_y.GetMax()) // y_inc
-                    ) * y_inc
+                    y_center = (sensor_h - actual_h) // 2
+                    y_set = (y_center // y_inc) * y_inc          # snap to increment
+                    y_set = max(node_offset_y.GetMin(),
+                                min(node_offset_y.GetMax(), y_set))
                     node_offset_y.SetValue(y_set)
-                    print(f"  OffsetY: {y_set}")
+                    print(f"  OffsetY: {y_set}  (centered on {sensor_h}px sensor)")
 
             # ----------------------------------------------------------------
             # TTL Trigger
@@ -320,7 +388,7 @@ class CameraStreamer:
                 else:
                     print(f"  {cam_name}: Continuous mode not available.")
                     return False
-                
+
             if cam.ExposureAuto.GetAccessMode() != PySpin.RW:
                 print('Unable to disable automatic exposure. Aborting...')
                 return False
@@ -328,12 +396,52 @@ class CameraStreamer:
             cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
             print('Automatic exposure disabled...')
 
-            # Ensure desired exposure time does not exceed the maximum
+            # Ensure desired exposure time does not exceed the maximum(15000us to be within 60fps timeframe)
             cam_cfg = self.cam_configs[cam_name]
-            exposure_time_to_set = cam_cfg.get("exposure_us", 5000)
-            exposure_time_to_set = min(cam.ExposureTime.GetMax(), exposure_time_to_set)
+            exposure_time_to_set = cam_cfg.get("exposure_us", 14000)  
+            exposure_time_to_set = min(15000, exposure_time_to_set)
             cam.ExposureTime.SetValue(exposure_time_to_set)
             print('Shutter time set to %s us...\n' % exposure_time_to_set)
+
+            # Gain
+            cam.GainAuto.SetValue(PySpin.GainAuto_Off)
+            gain_to_set = cam_cfg.get("gain_db", 10)
+            gain_to_set = min(cam.Gain.GetMax(), gain_to_set)
+            cam.Gain.SetValue(gain_to_set)
+            print(f'Gain set to {gain_to_set} dB')
+
+            # ISP
+            node_isp = PySpin.CBooleanPtr(nodemap.GetNode("IspEnable"))
+            if PySpin.IsAvailable(node_isp) and PySpin.IsWritable(node_isp):
+                node_isp.SetValue(False)
+                print("ISP disabled")
+
+            # Gamma — disabled in SpinView; set to 1.0 to match
+            node_gamma_en = PySpin.CBooleanPtr(nodemap.GetNode("GammaEnable"))
+            if PySpin.IsAvailable(node_gamma_en) and PySpin.IsWritable(node_gamma_en):
+                node_gamma_en.SetValue(False)
+                print("Gamma disabled")
+
+            node_gamma = PySpin.CFloatPtr(nodemap.GetNode("Gamma"))
+            if PySpin.IsAvailable(node_gamma) and PySpin.IsWritable(node_gamma):
+                node_gamma.SetValue(1.0)
+                print("Gamma set to 1.0")
+
+            # Black level
+            node_bl = PySpin.CFloatPtr(nodemap.GetNode("BlackLevel"))
+            if PySpin.IsAvailable(node_bl) and PySpin.IsWritable(node_bl):
+                bl = cam_cfg.get("black_level", 2.0)
+                node_bl.SetValue(bl)
+                print(f"Black level set to {bl}")
+
+            # Device Link Throughput — 90,000,000 bps per USB hub optimal limit
+            node_dlt = PySpin.CIntegerPtr(nodemap.GetNode("DeviceLinkThroughputLimit"))
+            if PySpin.IsAvailable(node_dlt) and PySpin.IsWritable(node_dlt):
+                throughput_limit = cam_cfg.get("throughput_limit", 90_000_000)
+                # Clamp to camera's supported range
+                throughput_limit = max(node_dlt.GetMin(), min(node_dlt.GetMax(), throughput_limit))
+                node_dlt.SetValue(throughput_limit)
+                print(f"Device link throughput limit set to: {throughput_limit}")
 
             return True
 
@@ -351,24 +459,6 @@ class CameraStreamer:
             cam.BeginAcquisition()
             status = "armed, waiting for TTL" if self.trigger_enabled else "acquiring"
             print(f"{name}: {status}")
-
-    # ------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------
-
-    def _append_metadata(self, writer, framecount, timestamp, sestime, cputime):
-        """Append one row. Only writes columns that are enabled in config."""
-        if writer is None:
-            return
-
-        cfg = self.metadata_config
-        row = []
-        if cfg.get("save_framecount", True): row.append(framecount)
-        if cfg.get("save_timestamp",  True): row.append(f"{timestamp:.9f}")
-        if cfg.get("save_sestime",    True): row.append(f"{sestime:.6f}")
-        if cfg.get("save_cputime",    True): row.append(f"{cputime:.6f}")
-
-        writer.writerow(row)
 
     # ------------------------------------------------------------------
     # Capture thread
@@ -397,10 +487,7 @@ class CameraStreamer:
                 sestime    = time.perf_counter() - self.start_t
                 cputime    = time.time()
 
-                converted = image_result.Convert(
-                    PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR
-                )
-                frame = np.array(converted.GetNDArray(), copy=True)
+                frame = np.array(image_result.GetNDArray(), copy=True)
                 image_result.Release()
 
                 # After image_result.Release(), inside the while loop
@@ -425,38 +512,52 @@ class CameraStreamer:
         self._final_frame_counts[cam_name] = frame_idx
 
     # ------------------------------------------------------------------
-    # Writer thread
+    # Writer thread  (MJPEG → AVI, matching SpinView behaviour)
     # ------------------------------------------------------------------
 
-    def _make_ffmpeg_writer(
+    def _make_ffmpeg_mjpeg_writer(
         self, output_path: str, width: int, height: int
-        ) -> subprocess.Popen:
-            if not shutil.which("ffmpeg"):
-                raise RuntimeError("ffmpeg not found on PATH")
+    ) -> subprocess.Popen:
+        """
+        Open an ffmpeg pipe that accepts raw grayscale frames on stdin and
+        encodes them as MJPEG inside an AVI container.
 
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-f",        "rawvideo",
-                "-vcodec",   "rawvideo",
-                "-pix_fmt",  "bgr24",
-                "-s",        f"{width}x{height}",
-                "-r",        str(self.fps),
-                "-i",        "pipe:0",
-                "-vcodec",   self.codec,
-                "-preset",   self.preset,
-                "-crf",      self.crf,
-                "-pix_fmt",  self.pix_fmt,
-                "-movflags", "+faststart",
-                output_path,
-            ]
-            return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        This replicates SpinView's "Video Recording Type: MJPG → save as .avi"
+        workflow.  Each frame is stored as an independent JPEG so random-access
+        and partial-file playback work without full re-encoding.
+
+        -q:v maps to JPEG quality: 2 = highest, 31 = lowest.
+        We convert the user-visible 0-100 quality scale to ffmpeg's 2-31 range.
+        """
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("ffmpeg not found on PATH")
+
+        # Convert 0–100 quality → ffmpeg q:v scale (2 best … 31 worst)
+        # quality=90 → q_val ≈ 5  (high quality, small files)
+        q_val = max(2, min(31, int(2 + (100 - self.jpeg_quality) * 29 / 100)))
+
+        cmd = [
+            "ffmpeg",
+            "-y",                        # overwrite output if exists
+            "-f",        "rawvideo",
+            "-vcodec",   "rawvideo",
+            "-pix_fmt",  "gray",         # Mono8 from camera
+            "-s",        f"{width}x{height}",
+            "-r",        str(self.fps),
+            "-i",        "pipe:0",       # read raw frames from stdin
+            "-vcodec",   "mjpeg",        # encode each frame as JPEG
+            "-q:v",      str(q_val),     # JPEG quality (2=best, 31=worst)
+            "-pix_fmt",  "yuvj420p",     # standard MJPEG chroma
+            output_path,                 # .avi extension → AVI container
+        ]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def _write_frames(self, cam_name: str):
         cam_cfg     = self.cam_configs[cam_name]
         label       = cam_cfg.get("name", cam_name)
         ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(self.output_dir, f"{label}_{ts}.mp4")
+        # Output as .avi — AVI container wrapping MJPEG frames (SpinView behaviour)
+        output_path = os.path.join(self.output_dir, f"{label}_{ts}.avi")
 
         proc                      = None
         metadata_file, csv_writer = self._init_metadata(cam_name)
@@ -473,8 +574,12 @@ class CameraStreamer:
 
             if proc is None:
                 h, w = frame.shape[:2]
-                proc = self._make_ffmpeg_writer(output_path, w, h)
-                print(f"{cam_name}: writing to {output_path} at {w}x{h}")
+                proc = self._make_ffmpeg_mjpeg_writer(output_path, w, h)
+                print(
+                    f"{cam_name}: writing MJPEG/AVI → {output_path} "
+                    f"at {w}x{h}  quality={self.jpeg_quality}"
+                )
+                time.sleep(0.1)
 
             try:
                 proc.stdin.write(frame.tobytes())
@@ -522,13 +627,14 @@ class CameraStreamer:
             total_frames  = frame_count,
             ttl_count     = ttl_count,
         )
+
     # ------------------------------------------------------------------
     # Thread startup
     # ------------------------------------------------------------------
 
     def _start_threads(self):
         for name, cam in self.cameras.items():
-            # Preview thread
+            # Capture thread — pulls frames from the camera ring buffer
             ct = threading.Thread(
                 target=self._capture_frame,
                 args=(name, cam),
@@ -538,7 +644,7 @@ class CameraStreamer:
             ct.start()
             self._capture_threads.append(ct)
 
-            # Write thread
+            # Writer thread — encodes and writes MJPEG/AVI to disk
             wt = threading.Thread(
                 target=self._write_frames,
                 args=(name,),
@@ -553,7 +659,7 @@ class CameraStreamer:
     # ------------------------------------------------------------------
 
     def get_preview(self, cam_name: str):
-        """Non-blocking. Returns latest BGR numpy frame or None."""
+        """Non-blocking. Returns latest grayscale numpy frame or None."""
         with self.preview_locks[cam_name]:
             return self.preview_frames[cam_name]
 
@@ -568,7 +674,7 @@ class CameraStreamer:
             cam.EndAcquisition()
             cam.DeInit()
 
-        del cam
+        self.cameras.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -600,81 +706,185 @@ def print_device_info(nodemap, cam_name: str) -> bool:
         return False
 
 
+def get_connected_serials(system: "PySpin.SystemPtr") -> list[dict]:
+    """
+    Return a list of dicts with serial/model/vendor for every connected camera.
+    Used by the setup wizard to auto-populate config without manual serial lookup.
+    """
+    found = []
+    cam_list = system.GetCameras()
+    for cam in cam_list:
+        tlmap = cam.GetTLDeviceNodeMap()
+        def _read(node_name):
+            n = PySpin.CStringPtr(tlmap.GetNode(node_name))
+            return n.GetValue() if PySpin.IsAvailable(n) and PySpin.IsReadable(n) else "unknown"
+        found.append({
+            "serial": _read("DeviceSerialNumber"),
+            "model":  _read("DeviceModelName"),
+            "vendor": _read("DeviceVendorName"),
+        })
+    cam_list.Clear()
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard — auto-discover cameras and write config.yaml interactively
+# ---------------------------------------------------------------------------
+
+def run_setup_wizard(system: "PySpin.SystemPtr", output_path: str = "config.yaml"):
+    """
+    Interactive setup wizard.
+
+    Enumerates every connected camera, lets the user assign a friendly name
+    to each one, then writes a ready-to-use config.yaml.  This avoids the need
+    to manually look up serial numbers in SpinView.
+
+    Usage:
+        python camera_acquisition.py --setup
+    """
+    print("\n" + "="*60)
+    print("  Camera Acquisition — Setup Wizard")
+    print("="*60)
+
+    devices = get_connected_serials(system)
+    if not devices:
+        print("No cameras detected. Check USB/GigE connections and drivers.")
+        return
+
+    print(f"\nFound {len(devices)} camera(s):\n")
+    for i, d in enumerate(devices):
+        print(f"  [{i}]  Serial: {d['serial']}   Model: {d['model']}   Vendor: {d['vendor']}")
+
+    # ---- Ask which cameras to include ----
+    print("\nEnter camera indices to include (comma-separated, e.g. 0,1) or press Enter for all:")
+    raw = input("  > ").strip()
+    if raw == "":
+        selected = list(range(len(devices)))
+    else:
+        try:
+            selected = [int(x.strip()) for x in raw.split(",")]
+        except ValueError:
+            print("Invalid input — including all cameras.")
+            selected = list(range(len(devices)))
+
+    cameras_cfg = {}
+    for i in selected:
+        d = devices[i]
+        default_name = f"cam{i}"
+        print(f"\nCamera {i}  (serial {d['serial']}, {d['model']})")
+        name = input(f"  Friendly name [{default_name}]: ").strip() or default_name
+        cameras_cfg[f"cam{i}"] = {
+            "serial":           d["serial"],
+            "name":             name,
+            "enabled":          True,
+            # Per-camera exposure — can be overridden per-device here
+            "exposure_us":      14000,    # 140 ms (within 16000us timeframe)
+            "gain_db":          10,
+            "black_level":      2.0,
+            "throughput_limit": 90_000_000,  # 90 Mbps (USB hub optimal throughput, more than 60 Mbps necessary)
+        }
+
+    # ---- Save directory ----
+    print("\nSave directory for recordings [./recordings]: ", end="")
+    save_dir = input().strip() or "./recordings"
+
+    # ---- Build the full config dict with all defaults matching SpinView ----
+    config = {
+        # Top-level save path; each session creates a timestamped subdirectory
+        "save_dir": save_dir,
+
+        "cameras": cameras_cfg,
+
+        "recording": {
+            # Frame rate — 59.99 Hz as configured in SpinView
+            "fps":           59.99,
+            # Video recording type: MJPEG frames stored in an AVI container,
+            # exactly matching SpinView's "MJPG → .avi" workflow
+            "jpeg_quality":  90,          # JPEG compression quality (0–100); SpinView default = 90
+            # Split size: null = no splitting (one continuous file per session)
+            "split_size_mb": None,
+        },
+
+        "roi": {
+            # Resolution: 1020×1020 as configured in SpinView
+            "width":    1020,
+            "height":   1020,
+            "offset_x": 0,
+            "offset_y": 0,
+        },
+
+        "trigger": {
+            # Set to true to enable hardware TTL trigger on GPIO Line0
+            "enabled":    False,
+            "line":       "Line0",
+            "activation": "RisingEdge",
+            "selector":   "AcquisitionStart",
+            "timeout_ms": 5000,
+        },
+
+        "preview": {
+            # Live OpenCV preview window (press ESC to stop recording)
+            "enabled":    True,
+            "downsample": 1,  # show every Nth frame in preview (1 = every frame)
+        },
+
+        "metadata": {
+            # Per-frame CSV and session summary CSV
+            "enabled":        True,
+            "save_framecount": True,
+            "save_timestamp":  True,
+            "save_sestime":    True,
+            "save_cputime":    True,
+        },
+    }
+
+    with open(output_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    print(f"\nConfig written to: {os.path.abspath(output_path)}")
+    print("Run acquisition with:  python camera_acquisition.py -c config.yaml\n")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def __init__(self, config: dict, system: "PySpin.SystemPtr"):
-    self.config       = config
-    self.system       = system
-    self._stop_event  = threading.Event()
-    self.start_t      = time.perf_counter()
-
-    self.cam_configs = {
-        name: cfg
-        for name, cfg in config["cameras"].items()
-        if cfg.get("enabled", True)
-    }
-
-    self.camera_count = len(self.cam_configs)
-    self.cam_names    = list(self.cam_configs.keys())
-    self.cameras: dict[str, PySpin.Camera] = {}
-
-    self.preview_frames = {name: None             for name in self.cam_names}
-    self.preview_locks  = {name: threading.Lock() for name in self.cam_names}
-    self.writer_queues  = {name: queue.Queue()    for name in self.cam_names}
-
-    self._final_ttl_counts:   dict[str, int] = {}
-    self._final_frame_counts: dict[str, int] = {}
-
-    self._capture_threads: list[threading.Thread] = []
-    self._writer_threads:  list[threading.Thread] = []
-
-    rec = config["recording"]
-    self.fps     = rec["fps"]
-    self.codec   = rec["codec"]
-    self.crf     = str(rec["crf"])
-    self.preset  = rec["preset"]
-    self.pix_fmt = rec["pixel_format"]
-
-    roi = config.get("roi", {})
-    self.target_w = roi.get("width",    None)
-    self.target_h = roi.get("height",   None)
-    self.offset_x = roi.get("offset_x", 0)
-    self.offset_y = roi.get("offset_y", 0)
-
-    trig = config.get("trigger", {})
-    self.trigger_enabled    = trig.get("enabled",    False)
-    self.trigger_line       = trig.get("line",       "Line0")
-    self.trigger_activation = trig.get("activation", "RisingEdge")
-    self.trigger_selector   = trig.get("selector",   "AcquisitionStart")
-    self.trigger_timeout    = trig.get("timeout_ms", 5000)
-
-    self.metadata_config = config.get("metadata", {})
-
-    save_dir   = config["save_dir"]
-    experiment = datetime.now().strftime("%Y%m%d_%H%M%S")
-    self.output_dir = os.path.join(save_dir, experiment)
-    os.makedirs(self.output_dir, exist_ok=True)
-
-    with open(os.path.join(self.output_dir, "config.yaml"), "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-
-    self._init_cameras()
-    self._start_threads()
-
 def main():
-    parser = argparse.ArgumentParser(description="Multi-camera acquisition.")
+    parser = argparse.ArgumentParser(description="Multi-camera MJPEG/AVI acquisition.")
     parser.add_argument(
         "-c", "--config",
         type=str,
         default="config.yaml",
         help="Path to configuration YAML file.",
     )
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help=(
+            "Run the interactive setup wizard to auto-detect cameras and "
+            "generate a config.yaml without manually looking up serial numbers."
+        ),
+    )
     args = parser.parse_args()
 
+    system  = PySpin.System.GetInstance()
+    version = system.GetLibraryVersion()
+    print(
+        f"Spinnaker {version.major}.{version.minor}."
+        f"{version.type}.{version.build}"
+    )
+
+    # ---- Setup wizard mode ----
+    if args.setup:
+        run_setup_wizard(system, output_path=args.config)
+        system.ReleaseInstance()
+        return
+
+    # ---- Normal acquisition mode ----
     if not os.path.isfile(args.config):
         print(f"Config file not found: {args.config}")
+        print("Tip: run  python camera_acquisition.py --setup  to generate one.")
+        system.ReleaseInstance()
         return
 
     config = load_config(args.config)
@@ -686,14 +896,8 @@ def main():
         os.remove(test.name)
     except IOError:
         print("Cannot write to current directory. Check permissions.")
+        system.ReleaseInstance()
         return
-
-    system  = PySpin.System.GetInstance()
-    version = system.GetLibraryVersion()
-    print(
-        f"Spinnaker {version.major}.{version.minor}."
-        f"{version.type}.{version.build}"
-    )
 
     # Print device info for all connected cameras
     cam_list = system.GetCameras()
@@ -703,6 +907,10 @@ def main():
     cam_list.Clear()
 
     streamer = CameraStreamer(config, system)
+
+    # Initialise cameras and start capture + writer threads
+    streamer._init_cameras()
+    streamer._start_threads()
 
     preview_enabled = config.get("preview", {}).get("enabled", True)
     print("\nRunning — press ESC to stop.\n")
@@ -717,7 +925,7 @@ def main():
                         label = config["cameras"][name].get("name", name)
                         cv2.imshow(label, frame)
 
-            if cv2.waitKey(20) == 27:
+            if cv2.waitKey(20) == 27:  # ESC key
                 break
 
     finally:
@@ -727,6 +935,7 @@ def main():
             cv2.destroyAllWindows()
         cam_list = system.GetCameras()
         cam_list.Clear()
+        del cam_list
         system.ReleaseInstance()
         print("Done.")
 
